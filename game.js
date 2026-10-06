@@ -31,6 +31,17 @@
   let floating = [];
   let soundContext;
   const images = config.levels.map(() => null);
+  const imageLoads = config.levels.map((level, tier) => ({
+    tier, path: level.image, state: level.image ? 'queued' : 'unused',
+    attempts: 0, requests: 0, candidate: null, retryTimer: null, error: null
+  }));
+  const IMAGE_CONCURRENCY = 2;
+  const IMAGE_ATTEMPTS = 4;
+  const IMAGE_TIMEOUT = 30000;
+  const IMAGE_RETRY_DELAYS = [1000, 3000, 6000];
+  const imageSession = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  let activeImageLoads = 0;
+  let hasImageIssue = false;
   const chainCanvases = [];
   const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   const twoDigits = value => String(value + 1).padStart(2, '0');
@@ -86,6 +97,7 @@
     ctx.fillStyle = level.color;
     ctx.fill();
     const image = images[tier];
+    let paintedImage = false;
     if (image) {
       ctx.save();
       ctx.clip();
@@ -94,10 +106,17 @@
       const square = Math.min(image.naturalWidth, image.naturalHeight) * clamp(value('scale', 1), 0.1, 1);
       const sourceX = clamp(value('x', 0.5) * image.naturalWidth - square / 2, 0, image.naturalWidth - square);
       const sourceY = clamp(value('y', 0.5) * image.naturalHeight - square / 2, 0, image.naturalHeight - square);
-      ctx.drawImage(image, sourceX, sourceY,
-        square, square, -radius, -radius, radius * 2, radius * 2);
-      ctx.restore();
-    } else {
+      try {
+        ctx.drawImage(image, sourceX, sourceY,
+          square, square, -radius, -radius, radius * 2, radius * 2);
+        paintedImage = true;
+      } catch {
+        // 单张图片绘制失败时退回编号，不能中断整个棋盘的动画。
+        images[tier] = null;
+        scheduleImageRetry(imageLoads[tier], 'draw');
+      } finally { ctx.restore(); }
+    }
+    if (!paintedImage) {
       ctx.fillStyle = '#3d443c';
       ctx.font = 'bold ' + Math.max(10, Math.min(58, radius * 0.72)) + 'px Georgia, serif';
       ctx.textAlign = 'center';
@@ -400,20 +419,112 @@
   resetDialog.addEventListener('close', () => { previousReady = undefined; updateLabels(); });
   overDialog.addEventListener('cancel', event => event.preventDefault());
 
-  config.levels.forEach((level, tier) => {
-    if (!level.image) return;
-    const image = new Image();
-    image.onload = () => {
-      const complete = () => { images[tier] = image; paintNext(); paintChain(); render(0); };
-      if (image.decode) image.decode().then(complete).catch(() => {});
-      else complete();
+  function imageLoadState() {
+    const required = imageLoads.filter(item => item.state !== 'unused');
+    return {
+      total: required.length,
+      loaded: required.filter(item => item.state === 'loaded').length,
+      failed: required.filter(item => item.state === 'failed').length,
+      pending: required.filter(item => ['queued', 'loading', 'retrying'].includes(item.state)).length,
+      levels: imageLoads.map(item => ({ level: item.tier + 1, state: item.state, attempts: item.attempts, error: item.error }))
     };
-    image.onerror = () => { /* 图片缺失时继续使用彩色编号圆球 */ };
-    const revision = config.assetRevision;
-    image.src = level.image + (revision ? (level.image.includes('?') ? '&' : '?') + 'v=' + encodeURIComponent(revision) : '');
-  });
+  }
 
-  const publicState = () => ({ ...engine.snapshot(), best, aimX, highestLevel: highestTier + 1, muted });
+  function paintImageStatus() {
+    const status = imageLoadState();
+    const retry = byId('retryImages');
+    const visible = hasImageIssue && status.loaded < status.total;
+    // 正常加载完成后恢复原来的操作提示，不挤占棋盘空间。
+    byId('playHint').hidden = visible;
+    retry.hidden = !visible;
+    retry.disabled = status.failed === 0;
+    retry.textContent = status.failed ? '头像未全加载 · 重试' : '头像加载中 ' + status.loaded + '/' + status.total;
+    retry.title = '已加载 ' + status.loaded + '/' + status.total + ' 张头像；仅重试加载失败的图片';
+  }
+
+  function scheduleImageRetry(item, reason) {
+    item.error = reason;
+    hasImageIssue = true;
+    if (item.attempts >= IMAGE_ATTEMPTS) {
+      item.state = 'failed';
+    } else {
+      item.state = 'retrying';
+      item.retryTimer = window.setTimeout(() => {
+        item.retryTimer = null;
+        if (item.state !== 'retrying') return;
+        item.state = 'queued';
+        pumpImages();
+      }, IMAGE_RETRY_DELAYS[item.attempts - 1]);
+    }
+    paintImageStatus();
+  }
+
+  function loadImage(item) {
+    item.state = 'loading';
+    item.attempts++;
+    item.requests++;
+    activeImageLoads++;
+    const image = new Image();
+    item.candidate = image;
+    let timeout;
+    const settle = reason => {
+      // 超时的旧请求即使晚到，也不能覆盖后来成功加载的图片。
+      if (item.state !== 'loading' || item.candidate !== image) return;
+      window.clearTimeout(timeout);
+      image.onload = null;
+      image.onerror = null;
+      item.candidate = null;
+      activeImageLoads--;
+      if (reason) {
+        image.removeAttribute('src');
+        scheduleImageRetry(item, reason);
+      } else {
+        images[item.tier] = image;
+        item.state = 'loaded';
+        item.error = null;
+        paintImageStatus();
+        paintNext();
+        paintChain();
+        render(0);
+      }
+      pumpImages();
+    };
+    // onload 和有效尺寸足以交给 Canvas 绘制，不依赖部分内置浏览器不稳定的 decode()。
+    image.onload = () => settle(image.naturalWidth > 0 && image.naturalHeight > 0 ? null : 'empty');
+    image.onerror = () => settle('network');
+    timeout = window.setTimeout(() => settle('timeout'), IMAGE_TIMEOUT);
+    const revision = config.assetRevision;
+    let source = item.path + (revision ? (item.path.includes('?') ? '&' : '?') + 'v=' + encodeURIComponent(revision) : '');
+    // 首次沿用原地址和已成功的缓存；失败重试使用新地址，绕过错误响应的缓存。
+    if (item.requests > 1) source += (source.includes('?') ? '&' : '?') + '_retry=' + imageSession + '-' + item.requests;
+    try { image.src = source; } catch { settle('source'); }
+  }
+
+  function pumpImages() {
+    // 分批加载，避免手机同时请求、解析 11 张大图。
+    while (activeImageLoads < IMAGE_CONCURRENCY) {
+      const item = imageLoads.find(record => record.state === 'queued');
+      if (!item) break;
+      loadImage(item);
+    }
+  }
+
+  function retryFailedImages() {
+    imageLoads.forEach(item => {
+      if (item.state !== 'failed') return;
+      item.attempts = 0;
+      item.error = null;
+      item.state = 'queued';
+    });
+    paintImageStatus();
+    pumpImages();
+  }
+
+  byId('retryImages').addEventListener('click', retryFailedImages);
+  window.addEventListener('online', retryFailedImages);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) retryFailedImages(); });
+
+  const publicState = () => ({ ...engine.snapshot(), best, aimX, highestLevel: highestTier + 1, muted, imageLoading: imageLoadState() });
   // 普通游戏状态读取；测试参数仅在本地验证链接中显式启用。
   window.CircleGame = Object.freeze({ getState: publicState });
   if (new URLSearchParams(location.search).has('test')) window.CircleGameTest = { engine, processEvents, updateLabels, reset };
@@ -470,4 +581,5 @@
   if (window.ResizeObserver) new ResizeObserver(resize).observe(stage);
   else window.addEventListener('resize', resize);
   requestAnimationFrame(frame);
+  pumpImages();
 })();

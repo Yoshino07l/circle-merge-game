@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="style.css">
   <script defer src="config.js?v=photos-20261006"></script>
   <script defer src="physics.js?v=photos-20261006"></script>
-  <script defer src="game.js?v=photos-20261006"></script>
+  <script defer src="game.js?v=qq-imagefix-20261006-v1"></script>
 </head>
 <body>
   <main class="game-layout">
@@ -20,7 +20,7 @@
         <canvas id="game" width="420" height="700" tabindex="0" aria-label="合成棋盘。左右方向键瞄准，空格投放。">请使用支持 Canvas 的浏览器。</canvas>
         <span class="board-caption" aria-hidden="true">让圆圆留在虚线下方</span>
       </div>
-      <div class="board-bottomline"><span class="touch-tip">按住拖动瞄准 · 松手投放</span><span class="mouse-tip">移动瞄准 · 点击投放</span><span id="readyStatus" role="status">可以投放</span></div>
+      <div class="board-bottomline"><span id="playHint"><span class="touch-tip">按住拖动瞄准 · 松手投放</span><span class="mouse-tip">移动瞄准 · 点击投放</span></span><button id="retryImages" type="button" hidden style="border:0;background:transparent;padding:0;font:inherit;color:inherit;text-align:left;min-height:24px" aria-label="重试加载未显示的头像">头像未全加载 · 重试</button><span id="readyStatus" role="status">可以投放</span></div>
     </section>
 
     <aside class="panel">
